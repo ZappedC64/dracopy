@@ -14,6 +14,44 @@ Created 2009 by Sascha Bader.
 Both programs use the kernal routines and are
 able to work with most file oriented IEC devices.
 
+RLE Edition (1.4rw)
+-------------------
+
+This fork (by Raj W., built on the cc65 DraCopy 1.3doj source) replaces DraCopy's
+plain copy with **RLE-compressed copying** so a single-drive user can move far more
+data per disk swap, adds program launching and a clean return to BASIC, and includes
+a handful of quality-of-life fixes.
+
+![dc64 RLE edition main screen](images/dc64rw-main.png)
+
+### New features
+
+- **RLE file copy** — files are RLE-compressed into a RAM buffer and decompressed
+  straight to the target, so the copy is byte-for-byte identical to the source. With
+  two drives it streams source→target with no swaps; on a single drive it buffers as
+  many files as fit, then prompts for SOURCE/TARGET disk swaps. A file that doesn't
+  shrink falls back to a raw (verbatim) copy, so output is never larger than the input.
+- **RLE single-drive disk copy** — a whole-disk copy that RLE-compresses each sector
+  into the RAM buffer before swapping. Empty/zero sectors compress to a few bytes, so
+  many more tracks fit in RAM per pass and far fewer disk swaps are needed. The buffer
+  combines the cc65 heap with the 8&nbsp;KB of RAM under the KERNAL ($E000–$FFFF) for
+  ~19&nbsp;KB total. Verified byte-identical on a full 683-sector round-trip.
+
+  ![RLE single-drive disk copy](images/dc64rw-diskcopy.png)
+
+- **F7 runs the selected program** — highlight a PRG and press F7 to LOAD and RUN it.
+- **Clean return to BASIC** — cc65 normally leaves BASIC banked out and its zero page
+  clobbered on exit; quit and F7 now restore a fully working BASIC (cold start) and the
+  default upper-case screen.
+- **Drive type re-detected when cycling devices (F3)** — swapping a drive on the same
+  device number (e.g. SD2IEC → 1541) now updates the reported type.
+- **Single-drive copying** — both windows may point at the same device, so a
+  device-8-only user can copy between two disks on one drive.
+- **Removed the F3 hex / F4 ASCII file viewers** to save space; the device-cycle key
+  moved to F3.
+
+![about / help screen](images/dc64rw-about.png)
+
 Directories are supported on CMD compatible devices and [sd2iec](https://www.c64-wiki.com/wiki/SD2IEC).
 The [SFD-1001](https://www.c64-wiki.com/wiki/SFD-1001) floppy is supported with the
 [IEEE-488](https://www.pagetable.com/?p=1303) interface and the C64 version, use the dc64ieee program.
@@ -43,6 +81,7 @@ Version Information and Download
 | 1.1doj | Dec 2021 | support 1571 and 1581 disk copy from a SD2IEC source drive | doj |
 | 1.2doj | May 2022 | support disk copy from CMD and U64 devices | doj | [dracopy-1.2doj.zip](https://www.cubic.org/~doj/c64/dracopy-1.2doj.zip)
 | 1.3doj | Aug 2022 | PET fixes by stargo | doj | [dracopy-1.3doj.zip](https://www.cubic.org/~doj/c64/dracopy-1.3doj.zip)
+| 1.4rw | Jun 2026 | RLE file copy, RLE single-drive disk copy, F7 auto-run, clean return to BASIC (C64) | Raj W. |
 
 DraCopy builds in alternate color schemes:
 
@@ -73,13 +112,11 @@ See the TODO section below for some functions that may have issues.
 | Key | Function |
 | --- | -------- |
 | F1, 1 | read directory in current window
-| F2, 2 | select the next device for the current window
-| F3, 3 | view current file as hex dump
-| F4, 4 | view current file as ASCII text
-| F5, 5 | copy all selected files from current window
+| F3, 3 | select the next device for the current window (re-detects the drive type)
+| F5, 5 | RLE-copy all selected files from current window
 | F6, 6 | delete all selected file in current window
 | F7, 7 | run the selected program
-| F8, 8 | [copy disk](https://raw.githubusercontent.com/doj/dracopy/master/images/dc64-diskcopy.png) from current window to the other device
+| F8, 8 | RLE [copy disk](https://raw.githubusercontent.com/doj/dracopy/master/images/dc64-diskcopy.png) from current window to the other device (single drive uses a compressed RAM buffer)
 | d | optimized disk copy, only write sectors which are not all 0 bytes.
 | ←, ESC, 0 | switch window
 | w | [enlarge or shrink](https://raw.githubusercontent.com/doj/dracopy/master/images/dc64-windowsize.png) current window
