@@ -197,6 +197,14 @@ extern BYTE DIR2H;
 #pragma charmap (0xff, 0x5f)
 #pragma charmap (0xfc, 0x5c)
 
+/* Build convenience: -DREU_C64REU (a quote-free flag) selects the CBM REU emd
+   driver, avoiding the brittle -DREU="..." command-line quoting that breaks
+   under Windows PowerShell.  The generic -DREU="<driver>.emd" form (see the
+   Makefile) still works and takes precedence. */
+#if defined(REU_C64REU) && !defined(REU)
+#define REU "c64-reu.emd"
+#endif
+
 #if !defined(__C64__)
 #undef REU
 #endif
