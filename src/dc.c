@@ -30,12 +30,12 @@
 #include <conio.h>
 #include <cbm.h>
 #include <errno.h>
-#include "cat.h"
 #include "dir.h"
 #include "base.h"
 #include "defines.h"
 #include "version.h"
 #include "ops.h"
+#include "rle.h"
 #if defined(REU)
 #include <em.h>
 #endif
@@ -78,7 +78,6 @@ void doToggleAll(const BYTE context);
 void doCopy(const BYTE context);
 void doDelete(const BYTE context);
 int doDiskCopy(const BYTE deviceFrom, const BYTE deviceTo, const BYTE optimized);
-int copy(const char *srcfile, const BYTE srcdevice, const char *destfile, const BYTE destdevice, BYTE type);
 void doMakeImage(const BYTE device);
 void doRelabel(const BYTE device);
 void nextWindowState(const BYTE context);
@@ -134,10 +133,8 @@ updateMenu()
   drawFrame(" " DRA_VERNUM " ",MENUX,MENUY,MENUW,MENUH,NULL);
 
   cputsxy(MENUXT,++menuy,"F1 READ DIR");
-  cputsxy(MENUXT,++menuy,"F2 DEVICE");
-  cputsxy(MENUXT,++menuy,"F3 VIEW HEX");
-  cputsxy(MENUXT,++menuy,"F4 VIEW ASC");
-  cputsxy(MENUXT,++menuy,"F5 COPY");
+  cputsxy(MENUXT,++menuy,"F3 DEVICE");
+  cputsxy(MENUXT,++menuy,"F5 FILECOPY");
   cputsxy(MENUXT,++menuy,"F6 DELETE");
   cputsxy(MENUXT,++menuy,"F7 RUN");
   cputsxy(MENUXT,++menuy,"F8 DISKCOPY");
@@ -146,7 +143,11 @@ updateMenu()
 #ifdef __PLUS4__
   cputsxy(MENUXT,++menuy,"EC SWITCH W");
 #else
-  cputsxy(MENUXT,++menuy," \xff SWITCH W");
+  /* the CBM left-arrow: emit PETSCII $5F at runtime (the #pragma charmap
+     remap of \xff isn't honored, so it would otherwise print a graphic). */
+  ++menuy;
+  gotoxy(MENUXT, menuy);
+  cputc(' '); cputc(CH_LARROW); cputs(" SWITCH W");
 #endif
   cputsxy(MENUXT,++menuy,"SP SELECT");
   cputsxy(MENUXT,++menuy," * INV SEL");
@@ -155,7 +156,10 @@ updateMenu()
   cputsxy(MENUXT,++menuy," M MAKE DIR");
   cputsxy(MENUXT,++menuy," F FORMAT");
   cputsxy(MENUXT,++menuy," L RELABEL");
-  cputsxy(MENUXT,++menuy," \xfc DEV ID");
+  /* the pound sign: emit PETSCII $5C at runtime (same charmap issue as above) */
+  ++menuy;
+  gotoxy(MENUXT, menuy);
+  cputc(' '); cputc(CH_POUND); cputs(" DEV ID");
   cputsxy(MENUXT,++menuy," @ DOS CMD");
   cputsxy(MENUXT,++menuy," I MAKE IMG");
   cputsxy(MENUXT,++menuy," D DSKCPY-O");
@@ -164,6 +168,8 @@ updateMenu()
 #else
   cputsxy(MENUXT,++menuy," W WIN SIZE");
 #endif
+  cputsxy(MENUXT,++menuy," . ABOUT");
+  cputsxy(MENUXT,++menuy," Q QUIT");
 }
 
 void
@@ -217,9 +223,20 @@ mainLoop(void)
         }
     }
 
-  // if no drive was found for the lower window,
-  // enlarge the upper window.
-  nextWindowState(context);
+  // No separate second drive: point the lower window at the SAME device as
+  // the upper one, so a single-drive user can still copy files (the RLE copy
+  // buffers them in RAM and prompts for a SOURCE/TARGET disk swap).
+  devices[1] = devices[0];
+  dirs[1] = readDir(NULL, devices[1], 1, sorted);
+  if (dirs[1])
+    {
+      getDeviceType(devices[1]);
+      showDir(1, context);
+    }
+  else
+    {
+      nextWindowState(context);
+    }
 
  found_lower_drive:
   while(1)
@@ -260,34 +277,19 @@ mainLoop(void)
           showDir(context, context);
           break;
 
-        case '2':
-        case CH_F2:
-          // cycle through devices until we find the next one, not
-          // used by the other context.
-          do
-            {
-              if (++devices[context] > 11)
-                devices[context] = 8;
-            }
-          while(devices[context] == devices[context^1]);
-          freeDir(&dirs[context]);
-          if (! devicetype[devices[context]])
-            {
-              getDeviceType(devices[context]);
-            }
-          showDir(context, context);
-          break;
-
         case '3':
         case CH_F3:
-          cathex(devices[context],dirs[context]->selected->dirent.name);
-          updateScreen(context, 2);
-          break;
-
-        case '4':
-        case CH_F4:
-          catasc(devices[context],dirs[context]->selected->dirent.name);
-          updateScreen(context, 2);
+          // cycle to the next device 8..11.  We intentionally allow selecting
+          // the same device as the other window so a single-drive user can copy
+          // between two disks on one drive (RLE buffer + swap prompts).
+          if (++devices[context] > 11)
+            devices[context] = 8;
+          freeDir(&dirs[context]);
+          /* always re-detect: the drive on this number may have been swapped
+             (e.g. SD2IEC -> 1541), so don't trust a cached type. */
+          devicetype[devices[context]] = NONE;
+          getDeviceType(devices[context]);
+          showDir(context, context);
           break;
 
         case '5':
@@ -570,55 +572,405 @@ mainLoop(void)
 #undef key_pressed
 }
 
+/* ============================================================
+ * RLE file copy  (replaces DraCopy's plain streaming copy)
+ *
+ * Each file is RLE-compressed into a RAM buffer, then decompressed
+ * straight to the target, so the written file is byte-for-byte
+ * identical to the source.  Compressing in RAM lets a single drive
+ * buffer several files, swap the disk once, and write them out --
+ * which a plain two-channel stream copy cannot do.
+ *   - different src/dest device : buffered round-trip, no swap.
+ *   - same device (one drive)   : prompt SOURCE / TARGET swaps.
+ *   - file too big to buffer    : streamed directly when two drives
+ *     are present, otherwise skipped.
+ * ============================================================ */
+
+#define MAXCAT      80
+#define RLE_READSZ  254
+#define RLE_MAXFILE 0xFC00u     /* refuse to buffer files >= ~63KB */
+
+typedef struct {
+  DirElement *e;
+  unsigned    off;      /* offset into the RLE buffer */
+  unsigned    olen;     /* original (uncompressed) length */
+  unsigned    clen;     /* stored length (compressed, or == olen if raw) */
+  BYTE        method;   /* 0 = RLE, 1 = raw */
+} CatEntry;
+
+static CatEntry cat[MAXCAT];
+
+static char
+typeletter(BYTE t)
+{
+  switch (t)
+    {
+    case CBM_T_SEQ: return 's';
+    case CBM_T_PRG: return 'p';
+    case CBM_T_USR: return 'u';
+    }
+  return 0;
+}
+
+/* show msg, wait for RETURN; return 1 if the user aborted */
+static BYTE
+promptSwap(const char *msg)
+{
+  int c;
+  newscreen(msg);
+  textcolor(DC_COLOR_HIGHLIGHT);
+  cputs("\n\rPRESS RETURN TO CONTINUE\n\r");
+  cputs("RUN/STOP OR ARROW-LEFT TO ABORT\n\r");
+  textcolor(DC_COLOR_TEXT);
+  for (;;)
+    {
+      c = cgetc();
+      if (c == CH_ENTER)
+        return 0;
+      if (c == CH_ESC || c == CH_LARROW || c == CH_STOP)
+        return 1;
+    }
+}
+
+/* re-read 'olen' raw bytes of e into dst.  return 0 on success. */
+static int
+rawRead(DirElement *e, BYTE srcdev, BYTE *dst, unsigned olen)
+{
+  unsigned got = 0;
+  unsigned want;
+  int n;
+  /* build the open name in linebuffer2 so doCopy's title in linebuffer survives */
+  sprintf(linebuffer2, "%s,%c", e->dirent.name, typeletter(e->dirent.type));
+  if (cbm_open(6, srcdev, CBM_READ, linebuffer2) != 0)
+    {
+      cbm_close(6);
+      return -1;
+    }
+  while (got < olen)
+    {
+      want = olen - got;
+      if (want > RLE_READSZ) want = RLE_READSZ;
+      n = cbm_read(6, dst + got, want);
+      if (n <= 0)
+        break;
+      got += n;
+    }
+  cbm_close(6);
+  return (got == olen) ? 0 : -1;
+}
+
+/* compress e into buf[*bufpos ..], updating *bufpos.
+   returns 1 = buffered (sets *po_len,*pc_len,*pmethod),
+           0 = did not fit, -1 = read/open error. */
+static int
+fillOne(DirElement *e, BYTE srcdev, BYTE *buf, unsigned bufcap,
+        unsigned *bufpos, unsigned *po_len, unsigned *pc_len, BYTE *pmethod)
+{
+  static BYTE rb[RLE_READSZ];
+  unsigned start = *bufpos;
+  unsigned olen = 0;
+  unsigned clen;
+  int n, k;
+
+  sprintf(linebuffer2, "%s,%c", e->dirent.name, typeletter(e->dirent.type));
+  if (cbm_open(6, srcdev, CBM_READ, linebuffer2) != 0)
+    {
+      cbm_close(6);
+      return -1;
+    }
+  rle_init(buf + start, bufcap - start);
+  do
+    {
+      n = cbm_read(6, rb, sizeof(rb));
+      if (n < 0)
+        {
+          cbm_close(6);
+          return -1;
+        }
+      for (k = 0; k < n; ++k)
+        rle_encode(rb[k]);
+      olen += n;
+      if (rle_overflow() || olen >= RLE_MAXFILE)
+        {
+          cbm_close(6);
+          return 0;
+        }
+    }
+  while (n == sizeof(rb));
+  rle_finish();
+  cbm_close(6);
+  if (rle_overflow())
+    return 0;
+
+  clen = rle_outlen();
+  if (clen >= olen)
+    {
+      /* raw fallback: never store more than the original */
+      if (rawRead(e, srcdev, buf + start, olen) != 0)
+        return -1;
+      *bufpos = start + olen;
+      *pc_len = olen;
+      *pmethod = 1;
+    }
+  else
+    {
+      *bufpos = start + clen;
+      *pc_len = clen;
+      *pmethod = 0;
+    }
+  *po_len = olen;
+  return 1;
+}
+
+/* direct stream copy (no compression) for oversized files when two
+   drives are present.  return 0 on success. */
+static int
+streamCopy(DirElement *e, BYTE srcdev, BYTE destdev)
+{
+  static BYTE sb[RLE_READSZ];
+  char tl = typeletter(e->dirent.type);
+  int n;
+  if (!tl)
+    return -1;
+  sprintf(linebuffer2, "%s,%c", e->dirent.name, tl);
+  if (cbm_open(6, srcdev, CBM_READ, linebuffer2) != 0)
+    {
+      cbm_close(6);
+      return -1;
+    }
+  sprintf(linebuffer2, "@:%s,%c", e->dirent.name, tl);
+  if (cbm_open(7, destdev, CBM_WRITE, linebuffer2) != 0)
+    {
+      cbm_close(7);
+      cbm_close(6);
+      return -1;
+    }
+  do
+    {
+      n = cbm_read(6, sb, sizeof(sb));
+      if (n < 0)
+        break;
+      if (n > 0 && cbm_write(7, sb, n) != n)
+        {
+          n = -1;
+          break;
+        }
+    }
+  while (n == sizeof(sb));
+  cbm_close(7);
+  cbm_close(6);
+  return (n < 0) ? -1 : 0;
+}
+
+/* write one buffered catalog entry to the target.  return 0 on success. */
+static int
+writeOne(const CatEntry *c, BYTE destdev, const BYTE *buf)
+{
+  char tl = typeletter(c->e->dirent.type);
+  int rc;
+  sprintf(linebuffer2, "@:%s,%c", c->e->dirent.name, tl);
+  if (cbm_open(7, destdev, CBM_WRITE, linebuffer2) != 0)
+    {
+      cbm_close(7);
+      return -1;
+    }
+  if (c->method == 1)
+    {
+      unsigned off = 0;
+      unsigned chunk;
+      rc = 0;
+      while (off < c->olen)
+        {
+          chunk = c->olen - off;
+          if (chunk > RLE_READSZ) chunk = RLE_READSZ;
+          if (cbm_write(7, buf + c->off + off, chunk) != (int)chunk)
+            {
+              rc = -1;
+              break;
+            }
+          off += chunk;
+        }
+    }
+  else
+    {
+      rc = rle_decompress_to_cbm(buf + c->off, c->olen, 7);
+    }
+  cbm_close(7);
+  return rc;
+}
+
 void
 doCopy(const BYTE context)
 {
-  BYTE flag = 0;
-  BYTE cnt = 0xf0;
-  DirElement * current;
-  const BYTE srcdev = devices[context];
-  const BYTE destdev = devices[context^1];
-  Directory * cwd = GETCWD;
-  int ret;
+  const BYTE srcdev  = devices[context];
+  const BYTE destdev = devices[context ^ 1];
+  const BYTE same    = (srcdev == destdev);
+  Directory *cwd = GETCWD;
+  DirElement *e;
+  BYTE *buf;
+  unsigned bufcap;
+  unsigned avail;
+  BYTE copied = 0, skipped = 0, errors = 0;
+  BYTE any = 0;
 
-  sprintf(linebuffer,"Filecopy from %i to %i",srcdev,destdev);
-  for(current = cwd->firstelement; current; current=current->next)
+  if (!cwd)
+    return;
+
+  /* if nothing is tagged, copy the current file */
+  for (e = cwd->firstelement; e; e = e->next)
+    if (e->flags == 1) { any = 1; break; }
+  if (!any && cwd->selected)
     {
-      if (++cnt >= BOTTOM)
+      cwd->selected->flags = 1;
+      any = 1;
+    }
+  if (!any)
+    return;
+
+  /* grab the largest contiguous RAM buffer we can for compressed data */
+  avail = _heapmaxavail();
+  if (avail < 0x500)
+    {
+      newscreen("NOT ENOUGH MEMORY FOR COPY");
+      waitKey(0);
+      return;
+    }
+  bufcap = avail - 0x400;
+  if (bufcap > 0x6000)
+    bufcap = 0x6000;
+  buf = malloc(bufcap);
+  while (!buf && bufcap > 0x200)
+    {
+      bufcap >>= 1;
+      buf = malloc(bufcap);
+    }
+  if (!buf)
+    {
+      newscreen("BUFFER ALLOC FAILED");
+      waitKey(0);
+      return;
+    }
+
+  sprintf(linebuffer, "RLE COPY FROM %i TO %i", srcdev, destdev);
+
+  for (;;)
+    {
+      unsigned bufpos = 0;
+      BYTE ncat = 0;
+      BYTE i;
+      BYTE pending = 0;
+
+      for (e = cwd->firstelement; e; e = e->next)
+        if (e->flags == 1) { pending = 1; break; }
+      if (!pending)
+        break;
+
+      if (same && promptSwap("INSERT SOURCE DISK, THEN"))
+        break;
+
+      newscreen(linebuffer);
+      gotoxy(0, 2);
+
+      /* ---- fill pass: compress files into the buffer ---- */
+      for (e = cwd->firstelement; e && ncat < MAXCAT; e = e->next)
         {
-          cnt = 0;
-          newscreen(linebuffer);
+          unsigned olen, clen;
+          BYTE method;
+          int r;
+
+          if (e->flags != 1)
+            continue;
+          if (!typeletter(e->dirent.type))
+            {
+              e->flags = 0;          /* not a copyable type */
+              ++skipped;
+              continue;
+            }
+
+          cprintf("PACK %-16s ", e->dirent.name);
+          r = fillOne(e, srcdev, buf, bufcap, &bufpos, &olen, &clen, &method);
+          if (r == 1)
+            {
+              cat[ncat].e = e;
+              cat[ncat].off = bufpos - clen;
+              cat[ncat].olen = olen;
+              cat[ncat].clen = clen;
+              cat[ncat].method = method;
+              ++ncat;
+              e->flags = 2;          /* buffered this pass */
+              cprintf("%u>%u\r\n", olen, clen);
+            }
+          else if (r == 0)
+            {
+              if (ncat == 0)
+                {
+                  /* too big to buffer at all */
+                  if (!same)
+                    {
+                      cputs("BIG: STREAM\r\n");
+                      if (streamCopy(e, srcdev, destdev) == 0)
+                        ++copied;
+                      else
+                        ++errors;
+                    }
+                  else
+                    {
+                      cputs("TOO BIG: SKIP\r\n");
+                      ++skipped;
+                    }
+                  e->flags = 0;
+                  continue;
+                }
+              cputs("BUFFER FULL\r\n");
+              break;                 /* write what we have; file stays tagged */
+            }
+          else
+            {
+              cputs("READ ERROR\r\n");
+              e->flags = 0;
+              ++errors;
+            }
         }
-      if (current->flags==1)
+
+      if (ncat == 0)
+        continue;                    /* nothing buffered; re-check pending */
+
+      if (same && promptSwap("INSERT TARGET DISK, THEN"))
         {
-          flag = 1;
-          ret = copy(current->dirent.name, srcdev, current->dirent.name, destdev, current->dirent.type);
-          if (ret == OK)
+          for (i = 0; i < ncat; ++i)
+            cat[i].e->flags = 1;     /* aborted before write: re-tag */
+          break;
+        }
+
+      newscreen(linebuffer);
+      gotoxy(0, 2);
+
+      /* ---- write pass: decompress catalog to the target ---- */
+      for (i = 0; i < ncat; ++i)
+        {
+          cprintf("WRITE %-16s ", cat[i].e->dirent.name);
+          if (writeOne(&cat[i], destdev, buf) == 0)
             {
-              // deselect
-              current->flags=0;
+              ++copied;
+              cputs("OK\r\n");
             }
-          else if (ret == ABORT)
+          else
             {
-              return;
+              ++errors;
+              textcolor(DC_COLOR_ERROR);
+              cputs("ERROR\r\n");
+              textcolor(DC_COLOR_TEXT);
             }
+          cat[i].e->flags = 0;       /* done */
         }
     }
 
-  if (! flag)
-    {
-      current = cwd->selected;
-      if (current)
-        {
-          ret = copy(current->dirent.name, srcdev, current->dirent.name, destdev, current->dirent.type);
-          if (ret == ERROR)
-            {
-              cputc(CH_ENTER);
-              cputc(10);
-              waitKey(0);
-            }
-        }
-    }
+  free(buf);
+
+  gotoxy(0, BOTTOM - 2);
+  cprintf("COPIED %i  SKIPPED %i  ERRORS %i\r\n", copied, skipped, errors);
+  if (errors || skipped)
+    waitKey(0);
 }
 
 void
@@ -772,139 +1124,6 @@ doRenameOrCopy(const BYTE context, const BYTE mode)
         }
     }
   updateScreen(context, 2);
-}
-
-static void
-copyERRMSG(const BYTE color, const char *msg)
-{
-  cputc(' ');
-  revers(1);
-  textcolor(color);
-  cputs(msg);
-  textcolor(DC_COLOR_TEXT);
-  revers(0);
-  cputs("\r\n");
-}
-
-int
-copy(const char *srcfile, const BYTE srcdevice, const char *destfile, const BYTE destdevice, BYTE type)
-{
-  int length=0;
-  int ret = OK;
-  unsigned long total_length = 0;
-  BYTE xpos, ypos;
-
-  BYTE *buf = (BYTE*) malloc(BUFFERSIZE);
-  if (! buf)
-    {
-#if !defined(__PET__)
-      cputs("Can't alloc\n\r");
-#endif
-      return ERROR;
-    }
-
-  switch(type)
-    {
-    case _CBM_T_SEQ:
-      type = 's';
-      break;
-    case _CBM_T_PRG:
-      type = 'p';
-      break;
-    case _CBM_T_USR:
-      type = 'u';
-      break;
-    default:
-#if !defined(__PET__)
-      cputs("unsupported file type\n\r");
-#endif
-      ret = ERROR;
-      goto done;
-    }
-
-  sprintf(linebuffer, "%s,%c", srcfile, type);
-  if (cbm_open(6, srcdevice, CBM_READ, linebuffer) != 0)
-    {
-#if !defined(__PET__)
-      cputs("Can't open input file!\n\r");
-#endif
-      ret = ERROR;
-      goto done;
-    }
-
-  // create destination string with filetype like "FILE,P"
-  sprintf(linebuffer, "%s,%c", destfile, type);
-  if (cbm_open(7, destdevice, CBM_WRITE, linebuffer) != 0)
-    {
-#if !defined(__PET__)
-      cputs("Can't open output file\n\r");
-#endif
-      ret = ERROR;
-      goto done;
-    }
-
-  cprintf("%-16s:",srcfile);
-  xpos = wherex();
-  ypos = wherey();
-  while(1)
-    {
-      if (kbhit())
-        {
-          char c = cgetc();
-          if (c == CH_ESC || c == CH_LARROW)
-            {
-              ret = ABORT;
-              break;
-            }
-        }
-
-      cputsxy(xpos, ypos, "R");
-      length = cbm_read (6, buf, BUFFERSIZE);
-      if (length < 0)
-        {
-          copyERRMSG(DC_COLOR_ERROR,"READ ERROR");
-          ret = ERROR;
-          break;
-        }
-
-      if (kbhit())
-        {
-          char c = cgetc();
-          if (c == CH_ESC || c == CH_LARROW)
-            {
-              ret = ABORT;
-              copyERRMSG(DC_COLOR_WARNING,"ABORT");
-              break;
-            }
-        }
-
-      if (length > 0)
-        {
-          cputsxy(xpos, ypos, "W");
-          if (cbm_write(7, buf, length) != length)
-            {
-              copyERRMSG(DC_COLOR_ERROR,"WRITE ERROR");
-              ret = ERROR;
-              break;
-            }
-          total_length += length;
-#if !defined(__PET__)
-          cprintf(" %lu bytes", total_length);
-#endif
-        }
-
-      if (length < BUFFERSIZE)
-        {
-          copyERRMSG(DC_COLOR_TEXT,"OK");
-          break;
-        }
-    } // while(1)
-
- done:
-  free(buf);
-  cbm_close(6);
-  cbm_close(7);
-  return ret;
 }
 
 /*
@@ -1168,6 +1387,209 @@ diskCopyTitle(const BYTE optimized, const BYTE yesno, const BYTE use_reu, const 
 #define USE_REU_DISKCOPY 1
 #endif
 
+/* ============================================================
+ * Single-drive RLE disk copy
+ *
+ * Reads whole sectors, RLE-compresses each into a RAM buffer until
+ * it fills, prompts for the TARGET disk, decompresses the buffered
+ * sectors back out, prompts for the SOURCE disk, and repeats.
+ * Because empty/zero sectors compress to a few bytes, far more
+ * tracks fit in RAM per pass than a raw copy -> fewer disk swaps.
+ * Used automatically when source and target are the same device.
+ * ============================================================ */
+#define DC_MAXSEC 768            /* max sectors buffered in one pass */
+static BYTE seclen[DC_MAXSEC];   /* per sector: (stored length - 1); 255 => raw 256 */
+
+/* advance (*t,*s) to the next sector; return 0 when past the last track. */
+static BYTE
+dcNext(BYTE dt, BYTE *t, BYTE *s)
+{
+  if (++(*s) >= maxSector(dt, *t))
+    {
+      *s = 0;
+      if (++(*t) >= maxTrack(dt))
+        return 0;
+    }
+  return 1;
+}
+
+/* ---- combined sector buffer ----
+   Region A is a normal heap allocation.  Region B is the 8 KB of RAM that
+   sits under the KERNAL ROM at $E000-$FFFF, reached by banking the KERNAL out
+   for the duration of a short memcpy with interrupts disabled.  This roughly
+   doubles the buffer so a single drive holds more tracks before a disk swap.
+   (cc65 already runs with BASIC banked out, so $A000-$CFFF is the heap; the
+   only other free RAM is under the KERNAL.) */
+#define EREG_ADDR  0xE000u
+#define EREG_SIZE  0x2000u        /* 8 KB under the KERNAL */
+static BYTE     dcscratch[256];   /* one sector's compressed bytes */
+static BYTE    *bufA;             /* heap region of the buffer */
+static unsigned capA;             /* size of bufA; total capacity = capA + EREG_SIZE */
+
+/* memcpy to/from under-KERNAL RAM at EREG_ADDR+eoff.
+   toE != 0: normal -> under-KERNAL ; toE == 0: under-KERNAL -> normal */
+static void
+eramCopy(BYTE *normal, unsigned eoff, unsigned n, BYTE toE)
+{
+  BYTE *e = (BYTE *)(EREG_ADDR + eoff);
+  BYTE save;
+  __asm__ ("sei");
+  save = *(volatile BYTE *)1;
+  *(volatile BYTE *)1 = 0x34;     /* BASIC+KERNAL out, I/O in: $E000-$FFFF = RAM */
+  if (toE) memcpy(e, normal, n);
+  else     memcpy(normal, e, n);
+  *(volatile BYTE *)1 = save;     /* restore cc65's banking (KERNAL back in) */
+  __asm__ ("cli");
+}
+
+/* store n bytes from src at logical offset pos in the combined buffer */
+static void
+bufPut(unsigned pos, BYTE *src, unsigned n)
+{
+  if (pos >= capA) { eramCopy(src, pos - capA, n, 1); return; }
+  if (pos + n <= capA) { memcpy(bufA + pos, src, n); return; }
+  { unsigned a = capA - pos;                 /* straddles the A/B boundary */
+    memcpy(bufA + pos, src, a);
+    eramCopy(src + a, 0, n - a, 1); }
+}
+
+/* fetch n bytes from logical offset pos into dst */
+static void
+bufGet(unsigned pos, BYTE *dst, unsigned n)
+{
+  if (pos >= capA) { eramCopy(dst, pos - capA, n, 0); return; }
+  if (pos + n <= capA) { memcpy(dst, bufA + pos, n); return; }
+  { unsigned a = capA - pos;
+    memcpy(dst, bufA + pos, a);
+    eramCopy(dst + a, 0, n - a, 0); }
+}
+
+static int
+doDiskCopyBuffered(const BYTE device, const BYTE optimized)
+{
+  const BYTE dt = devicetype[device];
+  const BYTE tracks = maxTrack(dt);
+  unsigned avail, totalcap;
+  BYTE ct = 0, cs = 0;          /* read cursor across the whole disk */
+  BYTE done = 0;
+  int ret, c;
+  unsigned wrote = 0, passes = 0;
+
+  if (tracks == 0)
+    {
+      newscreen("UNKNOWN DRIVE GEOMETRY");
+      waitKey(0);
+      return ERROR;
+    }
+
+  sprintf(linebuffer, "RLE DISKCOPY ON DEVICE %i? (Y/N)", device);
+  newscreen(linebuffer);
+  cputs("\n\rSINGLE DRIVE, COMPRESSED RAM BUFFER.\n\r");
+  cputs("YOU WILL SWAP SOURCE/TARGET DISKS.\n\r");
+  for (;;)
+    {
+      c = cgetc();
+      if (c == 'y' || c == 'Y') break;
+      if (c == 'n' || c == 'N' || c == CH_ESC || c == CH_LARROW) return ABORT;
+    }
+
+  /* disk copy doesn't need the directory listings - free them for buffer space */
+  freeDir(&dirs[0]);
+  freeDir(&dirs[1]);
+
+  avail = _heapmaxavail();
+  capA = (avail > 0x500) ? avail - 0x300 : 0;
+  if (capA > 0x6000) capA = 0x6000;
+  bufA = capA ? malloc(capA) : NULL;
+  while (!bufA && capA > 0x200) { capA >>= 1; bufA = malloc(capA); }
+  if (!bufA) capA = 0;            /* fall back to the under-KERNAL 8 KB only */
+  totalcap = capA + EREG_SIZE;
+
+  while (!done)
+    {
+      unsigned bufpos = 0, nsec = 0, off, i;
+      BYTE pt = ct, ps = cs;     /* this pass starts here */
+      BYTE wt, ws;
+      unsigned clen;
+
+      /* ---- READ PASS (source disk in the drive) ---- */
+      if (promptSwap("INSERT SOURCE DISK, THEN")) { ret = ABORT; goto finish; }
+      newscreen("RLE DISKCOPY - READING");
+      if (cbm_open(9, device, 5, "#") != 0 || cbm_open(6, device, 15, "") != 0)
+        { cbm_close(9); cbm_close(6);
+          newscreen("OPEN READ FAILED"); waitKey(0); ret = ERROR; goto finish; }
+
+      while (nsec < DC_MAXSEC)
+        {
+          unsigned need;
+          gotoxy(0, 3);
+          cprintf("READ  TRK %i SEC %i  BUF %u/%u  ", ct+1, cs, bufpos, totalcap);
+          ret = cbm_write(6, linebuffer, sprintf(linebuffer, "u1:5 0 %i %i", ct+1, cs));
+          if (ret < 0 || cbm_read(9, sectorBuf, 256) != 256)
+            memset(sectorBuf, 0, 256);    /* read error -> zero sector (keeps alignment) */
+          clen = rle_compress_block(sectorBuf, 256, dcscratch, 256);
+          need = (clen == 0 || clen >= 256) ? 256 : clen;   /* didn't shrink -> raw */
+          if (bufpos + need > totalcap)
+            break;                         /* buffer full: cursor stays, continue next pass */
+          if (need == 256) { bufPut(bufpos, sectorBuf, 256); seclen[nsec] = 255; }
+          else             { bufPut(bufpos, dcscratch, clen); seclen[nsec] = (BYTE)(clen - 1); }
+          ++nsec;
+          bufpos += need;
+          if (!dcNext(dt, &ct, &cs)) { done = 1; break; }
+        }
+      cbm_close(9); cbm_close(6);
+
+      if (nsec == 0) { if (done) break; ret = ERROR; goto finish; }
+      ++passes;
+
+      /* ---- WRITE PASS (target disk in the drive) ---- */
+      if (promptSwap("INSERT TARGET DISK, THEN")) { ret = ABORT; goto finish; }
+      newscreen("RLE DISKCOPY - WRITING");
+      if (cbm_open(7, device, 5, "#") != 0 || cbm_open(8, device, 15, "") != 0)
+        { cbm_close(7); cbm_close(8);
+          newscreen("OPEN WRITE FAILED"); waitKey(0); ret = ERROR; goto finish; }
+
+      wt = pt; ws = ps; off = 0;
+      for (i = 0; i < nsec; ++i)
+        {
+          if (seclen[i] == 255)
+            { bufGet(off, sectorBuf, 256); clen = 256; }
+          else
+            { clen = (unsigned)seclen[i] + 1;
+              bufGet(off, dcscratch, clen);
+              rle_decompress_to_mem(dcscratch, sectorBuf, 256); }
+          off += clen;
+
+          gotoxy(0, 3);
+          cprintf("WRITE TRK %i SEC %i  %u/%u    ", wt+1, ws, i+1, nsec);
+
+          if (optimized)
+            {
+              unsigned z; BYTE nz = 0;
+              for (z = 0; z < 256; ++z) if (sectorBuf[z]) { nz = 1; break; }
+              if (!nz) { dcNext(dt, &wt, &ws); continue; }  /* skip all-zero sector */
+            }
+
+          cbm_write(8, "b-p:5 0", 7);
+          if (cbm_write(7, sectorBuf, 256) != 256)
+            { textcolor(DC_COLOR_ERROR); cputs(" WERR "); textcolor(DC_COLOR_TEXT); }
+          cbm_write(8, linebuffer, sprintf(linebuffer, "u2:5 0 %i %i", wt+1, ws));
+          ++wrote;
+          dcNext(dt, &wt, &ws);
+        }
+      cbm_write(8, "i", 1);      /* initialize: drive re-reads the new BAM */
+      cbm_close(7); cbm_close(8);
+    }
+
+  ret = OK;
+ finish:
+  free(bufA); bufA = NULL;
+  gotoxy(0, BOTTOM-2);
+  cprintf("WROTE %u SECTORS IN %u PASS(ES)\r\n", wrote, passes);
+  waitKey(0);
+  return ret;
+}
+
 /**
  * disk sector copy from device @p deviceFrom to @p deviceTo.
  * based on version 1.0e, then heavily modified.
@@ -1200,6 +1622,10 @@ doDiskCopy(const BYTE deviceFrom, const BYTE deviceTo, const BYTE optimized)
   unsigned page = 0;
   use_reu = cachedFileSize == diskImageSize(devicetype_from);
 #endif
+
+  /* single drive: use the compressed RAM-buffer copy with disk swaps */
+  if (deviceFrom == deviceTo)
+    return doDiskCopyBuffered(deviceFrom, optimized);
 
 #if !defined(__PET__)
   if (max_track == 0)
@@ -1372,7 +1798,7 @@ doDiskCopy(const BYTE deviceFrom, const BYTE deviceTo, const BYTE optimized)
       gotoxy(0,BOTTOM);
       if (track == 0)
         {
-          cputs("press \xff to abort");
+          cputs("press "); cputc(CH_LARROW); cputs(" to abort");
         }
       else if (track == 1 && !optimized)
         {

@@ -25,6 +25,11 @@
 #ifndef DEFINES_H_
 #define DEFINES_H_
 
+/* Newer cc65 (>=2.19) renamed COLOR_VIOLET to COLOR_PURPLE. */
+#ifndef COLOR_VIOLET
+#define COLOR_VIOLET COLOR_PURPLE
+#endif
+
 #if defined(__PET__) || defined(__CBM610__)
 #define COLOR_LIGHTGREEN COLOR_WHITE
 #define COLOR_LIGHTBLUE COLOR_WHITE
@@ -185,8 +190,12 @@ extern BYTE DIR2H;
 #define CH_UARROW 0x5e
 #define CH_POUND  0x5c
 
-#pragma charmap (0xff, 0x5f);
-#pragma charmap (0xfc, 0x5c);
+/* NOTE: these charmap remaps are NOT honored by the cc65 build used here
+   (verified: \xff still reaches the screen as a graphic, not the left-arrow).
+   Code that needs the CBM left-arrow/up-arrow/pound therefore emits them at
+   runtime via cputc(CH_LARROW/CH_UARROW/CH_POUND) instead of these literals. */
+#pragma charmap (0xff, 0x5f)
+#pragma charmap (0xfc, 0x5c)
 
 #if !defined(__C64__)
 #undef REU

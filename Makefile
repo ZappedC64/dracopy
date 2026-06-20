@@ -29,7 +29,7 @@
 ##############################################################################
 # building
 
-VER=1.3doj
+VER=1.4rw
 
 CFLAGS+=-I include -O -Or -Os -r -D DRA_VERNUM=\"$(VER)\" -D DRA_VERDATE=\"2022-05-07\"
 
@@ -48,7 +48,7 @@ all:	$(TARGETS) $(D64)
 $(D64):	$(TARGETS) $(REU)
 	sh d64.sh 'dracopy $(VER),dj' $(D64) $(REU) dc64 db64 dc6480 dc128 db128 dc1280 db1280 dcp4 dbp4
 
-COMMON_SRC=src/screen.c src/cat.c src/dir.c src/base.c src/ops.c
+COMMON_SRC=src/screen.c src/rle.c src/dir.c src/base.c src/ops.c
 DC_SRC=src/dc.c $(COMMON_SRC)
 
 dc64:	$(DC_SRC)

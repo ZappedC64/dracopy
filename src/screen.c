@@ -132,6 +132,11 @@ exitScreen(void)
   bgcolor(screen_bgc);
   textcolor(screen_textc);
   clrscr();
+#if defined(__C64__) || defined(__C128__)
+  /* cc65 conio leaves the VIC on the lower-case charset ($D018 bit 1 set);
+     clear it so we hand BASIC back its default upper-case/graphics screen. */
+  *(BYTE*)0xd018 &= ~0x02;
+#endif
 #if defined(__PET__)
   /* Restore character set */
   if (via_pcr != -1)

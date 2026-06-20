@@ -131,6 +131,8 @@ dosCommand(const BYTE lfn, const BYTE drive, const BYTE sec_addr, const char *cm
   int res;
   if (cbm_open(lfn, drive, sec_addr, cmd) != 0)
     {
+      cbm_close(lfn);   /* release the LFN even on open failure, else the KERNAL
+                           keeps it allocated -> "file open" error next time */
       return _oserror;
     }
 
@@ -169,44 +171,74 @@ cmd(const BYTE device, const char *cmd)
   return dosCommand(15, device, 15, cmd);
 }
 
+/* Hand control back to BASIC cleanly.  cc65 runs with BASIC ROM banked out and,
+   on a normal exit, lets BASIC continue dc64's "10 SYS..." stub straight into
+   our machine code (garbage -> "?syntax error in 311") AND can leave BASIC
+   banked out so even NEW fails.  Instead we bank BASIC ROM back in and jump
+   into BASIC's READY/main loop (direct mode).  CHRGET, the $0300 vectors and
+   the program pointers are still intact, so BASIC works normally -- and any
+   commands we left in the keyboard buffer are executed.  Never returns. */
+void
+returnToBasic(void)
+{
+  __asm__ ("lda #$37");
+  __asm__ ("sta $01");        /* BASIC + KERNAL + I/O all mapped in */
+  __asm__ ("jmp ($a000)");    /* BASIC cold start: full re-init -> working BASIC */
+}
+
+/* RUN the BASIC program tokenized at $0801 (caller sets TXTTAB/VARTAB).  Banks
+   BASIC in, fixes MEMSIZ (cc65 leaves it wrong), then uses the real BASIC RUN
+   path: $A659 sets the text pointer to the program start and does CLR (which
+   re-initialises the runtime zero page), then $A7AE interprets.  Never returns. */
+void
+runProgram(void)
+{
+  __asm__ ("lda #$37");
+  __asm__ ("sta $01");        /* BASIC + KERNAL + I/O mapped in */
+  __asm__ ("lda #$00");
+  __asm__ ("sta $37");        /* MEMSIZ lo */
+  __asm__ ("lda #$a0");
+  __asm__ ("sta $38");        /* MEMSIZ hi -> top of BASIC RAM = $A000 */
+  __asm__ ("jsr $a659");      /* set TXTPTR to start of program + perform CLR */
+  __asm__ ("jmp $a7ae");      /* enter the BASIC interpreter (run from start) */
+}
+
 void
 execute(char * prg, BYTE device)
 {
-#if defined(__C64__) && defined(CHAR80)
-  BYTE len = sprintf((char*)KBCHARS, "lO\"%s\",%i", prg, device);
-  *((unsigned char *)KBCHARS + len) = 13;  ++len;
-  *((unsigned char *)KBCHARS + len) = 'r'; ++len;
-  *((unsigned char *)KBCHARS + len) = 'U'; ++len;
-  *((unsigned char *)KBCHARS + len) = 13;  ++len;
-  *((unsigned char *)KBNUM) = len;
-#else
-  int i;
-  // prepare the screen with the basic command to load the next program
+  /* Build a one-line BASIC loader in the (now-unneeded) BASIC stub area at
+   * $0801 and RUN it:   10 LOAD"<prg>",<dev>,1
+   * A LOAD that runs inside a program auto-chains -- BASIC loads the file
+   * (overwriting this loader and our code, but BASIC ROM is in control by then)
+   * and runs it.  The loader is tiny so it fits below our code at $0840. */
+  BYTE *p = (BYTE*)0x0803;     /* just past the 2-byte line link at $0801 */
+  unsigned end;
+  BYTE i;
+
   exitScreen();
 
-  gotoxy(0,2);
-  cprintf("load\"");
-  for (i=0; i<strlen(prg); i++)
-    cbm_k_bsout(prg[i]);
-  cprintf("\",%i,1", device);
-  gotoxy(0,7);
-  cputs("run");
+  *(BYTE*)0x0800 = 0x00;       /* TXTTAB-1 must be $00 (cc65 leaves junk here):
+                                  the RUN path sets TXTPTR=$0800 and the BASIC
+                                  interpreter reads this byte as the end-of-line
+                                  preceding the first line's link */
+  *p++ = 0x0a; *p++ = 0x00;    /* line number 10 */
+  *p++ = 0x93; *p++ = 0x22;    /* LOAD token, opening quote */
+  for (i = 0; prg[i]; ++i)
+    *p++ = prg[i];            /* filename (already PETSCII) */
+  *p++ = 0x22; *p++ = 0x2c;    /* closing quote, comma */
+  if (device >= 10) { *p++ = '1'; *p++ = '0' + (device - 10); }
+  else                *p++ = '0' + device;
+  *p++ = 0x2c; *p++ = 0x31;    /* ,1 */
+  *p++ = 0x00;                 /* end of BASIC line */
+  end = (unsigned)p;
+  *p++ = 0x00; *p++ = 0x00;    /* end-of-program marker */
 
-#if !defined(__PET__)
-  gotoxy(6,BOTTOM);
-  cputs("this program was loaded by DraCopy");
-#endif
+  *(BYTE*)0x0801 = (BYTE)(end & 0xff);   /* line link -> end marker */
+  *(BYTE*)0x0802 = (BYTE)(end >> 8);
+  *(BYTE*)0x002b = 0x01; *(BYTE*)0x002c = 0x08;                                /* TXTTAB = $0801 */
+  *(BYTE*)0x002d = (BYTE)((end+2)&0xff); *(BYTE*)0x002e = (BYTE)((end+2)>>8);  /* VARTAB */
 
-#if defined(KBCHARS)
-  // put two CR in keyboard buffer
-  *((unsigned char *)KBCHARS)=13;
-  *((unsigned char *)KBCHARS+1)=13;
-  *((unsigned char *)KBNUM)=2;
-#endif
-
-  // exit DraCopy, which will execute the BASIC LOAD above
-  gotoxy(0,0);
-#endif
+  runProgram();
   exit(0);
 }
 
@@ -280,6 +312,7 @@ main(void)
   initScreen(DC_COLOR_BORDER, DC_COLOR_BG, DC_COLOR_TEXT);
   mainLoop();
   exitScreen();
+  returnToBasic();   /* quit to a WORKING BASIC (ROM banked back in) */
   return 0;
 }
 
@@ -287,10 +320,8 @@ main(void)
 
 static const char* helpcontent[] = {
   "F1", "read dir",
-  "F2", "change dev",
-  "F3", "view hex",
-  "F4", "view ASCII",
-  "F5", "copy files",
+  "F3", "change dev",
+  "F5", "file copy",
   "F6", "delete file",
   "F7", "run PRG",
   "F8", "disk copy",
@@ -353,6 +384,8 @@ about(const char *progname)
 
   textcolor(DC_COLOR_DIM);
   cputs("Copyright 2009 by Draco and others\n\r"
+        "RLE file & disk copy and minor\n\r"
+        "bug fixes by Raj W.\n\r"
         "https://github.com/doj/dracopy\n\r"
         "\n\r"
         "THIS PROGRAM IS DISTRIBUTED IN THE HOPE\n\r"
@@ -363,9 +396,14 @@ about(const char *progname)
 
   while(*h)
     {
-      // print key
+      // print key (the CBM left-arrow/up-arrow/pound chars rely on a charmap
+      // remap that this cc65 build ignores, so emit them as runtime PETSCII)
       textcolor(DC_COLOR_TEXT);
-      cputsxy(x + 2 - strlen(*h), y, *h);
+      gotoxy(x + 2 - strlen(*h), y);
+      if      ((BYTE)(*h)[0] == 0xff && (*h)[1] == 0) cputc(CH_LARROW);
+      else if ((BYTE)(*h)[0] == 0x5e && (*h)[1] == 0) cputc(CH_UARROW);
+      else if ((BYTE)(*h)[0] == 0xfc && (*h)[1] == 0) cputc(CH_POUND);
+      else                                            cputs(*h);
       ++h;
 
       // print description

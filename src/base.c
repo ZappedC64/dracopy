@@ -28,6 +28,9 @@
 
 BYTE waitKey(BYTE flag)
 {
+  /* "PRESS A KEY" = 11 chars; with the flag, + " (RUNSTOP or Q to stop)" = 34 */
+  const BYTE len = flag ? 34 : 11;
+  gotoxy((SCREENW - len) / 2, wherey());
   revers(1);
   textcolor(DC_COLOR_WAITKEY);
   cputs("PRESS A KEY");
