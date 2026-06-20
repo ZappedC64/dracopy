@@ -3,11 +3,9 @@ DraCopy and DraBrowse
 
 DraCopy - a simple copy program.
 
-![dracopy screenshot](https://raw.githubusercontent.com/doj/dracopy/master/images/dc64.png)
+![dracopy screenshot](images/dc64rw-main.png)
 
 DraBrowse  - a simple file browser.
-
-![drabrowse screenshot](https://raw.githubusercontent.com/doj/dracopy/master/images/db64.png)
 
 Created 2009 by Sascha Bader.
 
@@ -21,8 +19,6 @@ This fork (by Raj W., built on the cc65 DraCopy 1.3doj source) replaces DraCopy'
 plain copy with **RLE-compressed copying** so a single-drive user can move far more
 data per disk swap, adds program launching and a clean return to BASIC, and includes
 a handful of quality-of-life fixes.
-
-![dc64 RLE edition main screen](images/dc64rw-main.png)
 
 ### New features
 
