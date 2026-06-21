@@ -37,6 +37,12 @@ a handful of quality-of-life fixes.
 
   ![RLE single-drive disk copy](images/dc64rw-diskcopy.png)
 
+  > **Known issue:** the REU disk copy is verified byte-identical on real Commodore
+  > REUs (tested on a 1764 128&nbsp;KB and a 1750 512&nbsp;KB) and in VICE, but it
+  > currently produces a corrupt disk on the **Kung-Fu Flash 2** REU emulation. Until
+  > that's resolved, KFF2 users should use the regular (non-REU) `dc64`, which copies
+  > reliably via the RAM buffer.
+
 - **F7 runs the selected program** — highlight a PRG and press F7 to LOAD and RUN it.
 - **Clean return to BASIC** — cc65 normally leaves BASIC banked out and its zero page
   clobbered on exit; quit and F7 now restore a fully working BASIC (cold start) and the
