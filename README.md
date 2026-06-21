@@ -87,13 +87,6 @@ Version Information and Download
 | 1.3doj | Aug 2022 | PET fixes by stargo | doj | [dracopy-1.3doj.zip](https://www.cubic.org/~doj/c64/dracopy-1.3doj.zip)
 | 1.4rw | Jun 2026 | RLE file copy, RLE single-drive disk copy, F7 auto-run, clean return to BASIC (C64) | Raj W. |
 
-The following special builds of dracopy are available for download:
-
-| build | Download |
-| ----- | -------- |
-| Commodore REU for dc64 | [dracopy-1.3doj-reu.zip](https://www.cubic.org/~doj/c64/dracopy-1.3doj-reu.zip)
-
-
 The program can be built with support for other Commodore RAM expansion devices like GeoRam.
 All RAM expansion devices supported by the cc65 compiler's [extended memory device](https://www.cc65.org/doc/c64-5.html) (emd) drivers can be used.
 
