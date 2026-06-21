@@ -1493,7 +1493,9 @@ doDiskCopyBuffered(const BYTE device, const BYTE optimized)
   const BYTE tracks = maxTrack(dt);
   unsigned avail = 0, totalcap = 0;
   unsigned reucap = 0;          /* REU capacity in whole sectors (0 = no REU) */
+  unsigned reukb = 0;           /* REU size in KB, for display */
   BYTE use_reu = 0;
+  const char *dctitle;
   BYTE ct = 0, cs = 0;          /* read cursor across the whole disk */
   BYTE done = 0;
   int ret, c;
@@ -1506,13 +1508,23 @@ doDiskCopyBuffered(const BYTE device, const BYTE optimized)
       return ERROR;
     }
 
-  sprintf(linebuffer, "RLE DISKCOPY ON DEVICE %i? (Y/N)", device);
-  newscreen(linebuffer);
 #if defined(USE_REU_DISKCOPY)
+  /* a fitted REU holds whole raw sectors (one per page); the disk usually fits
+     in one pass -> a single swap.  Capped to DC_MAXSEC sectors. */
   if (em_pagecount() > 0)
-    cputs("\n\rSINGLE DRIVE, REU SECTOR BUFFER.\n\r");
-  else
+    {
+      reucap = (em_pagecount() > DC_MAXSEC) ? DC_MAXSEC : (unsigned)em_pagecount();
+      reukb  = (unsigned)(em_pagecount() / 4);   /* pages * 256 / 1024 */
+      use_reu = (reucap != 0);
+    }
 #endif
+  dctitle = use_reu ? "REU DISKCOPY" : "RLE DISKCOPY";
+
+  sprintf(linebuffer, "%s ON DEVICE %i? (Y/N)", dctitle, device);
+  newscreen(linebuffer);
+  if (use_reu)
+    cprintf("\n\rSINGLE DRIVE, %uK REU SECTOR BUFFER.\n\r", reukb);
+  else
     cputs("\n\rSINGLE DRIVE, COMPRESSED RAM BUFFER.\n\r");
   cputs("YOU WILL SWAP SOURCE/TARGET DISKS.\n\r");
   for (;;)
@@ -1526,15 +1538,6 @@ doDiskCopyBuffered(const BYTE device, const BYTE optimized)
   freeDir(&dirs[0]);
   freeDir(&dirs[1]);
 
-#if defined(USE_REU_DISKCOPY)
-  /* a fitted REU holds whole raw sectors (one per page); the disk usually fits
-     in one pass -> a single swap.  Capped to DC_MAXSEC sectors. */
-  if (em_pagecount() > 0)
-    {
-      reucap = (em_pagecount() > DC_MAXSEC) ? DC_MAXSEC : (unsigned)em_pagecount();
-      use_reu = (reucap != 0);
-    }
-#endif
   if (!use_reu)
     {
       /* no REU: RLE-compress sectors into the heap (region A) plus the 8 KB
@@ -1557,7 +1560,9 @@ doDiskCopyBuffered(const BYTE device, const BYTE optimized)
 
       /* ---- READ PASS (source disk in the drive) ---- */
       if (promptSwap("INSERT SOURCE DISK, THEN")) { ret = ABORT; goto finish; }
-      newscreen("RLE DISKCOPY - READING");
+      sprintf(linebuffer, "%s - READING", dctitle);
+      newscreen(linebuffer);
+      if (use_reu) { gotoxy(0, 1); cprintf("REU %uK  %u SECTORS/PASS", reukb, reucap); }
       if (cbm_open(9, device, 5, "#") != 0 || cbm_open(6, device, 15, "") != 0)
         { cbm_close(9); cbm_close(6);
           newscreen("OPEN READ FAILED"); waitKey(0); ret = ERROR; goto finish; }
@@ -1597,7 +1602,9 @@ doDiskCopyBuffered(const BYTE device, const BYTE optimized)
 
       /* ---- WRITE PASS (target disk in the drive) ---- */
       if (promptSwap("INSERT TARGET DISK, THEN")) { ret = ABORT; goto finish; }
-      newscreen("RLE DISKCOPY - WRITING");
+      sprintf(linebuffer, "%s - WRITING", dctitle);
+      newscreen(linebuffer);
+      if (use_reu) { gotoxy(0, 1); cprintf("REU %uK  %u SECTORS/PASS", reukb, reucap); }
       if (cbm_open(7, device, 5, "#") != 0 || cbm_open(8, device, 15, "") != 0)
         { cbm_close(7); cbm_close(8);
           newscreen("OPEN WRITE FAILED"); waitKey(0); ret = ERROR; goto finish; }
