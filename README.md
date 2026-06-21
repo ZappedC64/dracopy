@@ -31,9 +31,9 @@ a handful of quality-of-life fixes.
   before swapping. Empty/zero sectors compress to a few bytes, so many more tracks fit
   per pass and far fewer disk swaps are needed. The buffer combines the cc65 heap with
   the 8&nbsp;KB of RAM under the KERNAL ($E000–$FFFF) for ~19&nbsp;KB. **In the REU
-  build, a fitted RAM expansion is added as extra buffer** — typically the *entire*
-  disk fits, so a single-drive copy needs **just one swap**. Verified byte-identical on
-  a full 683-sector round-trip (one pass with a REU, several without).
+  build, a fitted RAM expansion holds whole raw sectors** (one per page) — typically
+  the *entire* disk fits, so a single-drive copy needs **just one swap**. Verified
+  byte-identical on a full 683-sector round-trip.
 
   ![RLE single-drive disk copy](images/dc64rw-diskcopy.png)
 

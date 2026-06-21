@@ -1442,73 +1442,57 @@ eramCopy(BYTE *normal, unsigned eoff, unsigned n, BYTE toE)
   __asm__ ("cli");
 }
 
-#if defined(USE_REU_DISKCOPY)
-/* Region C: a fitted RAM expansion (REU/GeoRam/...).  Move n (<=256) bytes
-   to/from byte offset roff in extended memory.  The em_copy interface is a
-   linear (page:offs,count) DMA, so a copy may freely cross 256-byte pages. */
+/* store n bytes from src at logical offset pos in the RLE RAM buffer
+   (region A heap + region B under-KERNAL). */
 static void
-reuPut(unsigned long roff, BYTE *src, unsigned n)
+bufPut(unsigned pos, BYTE *src, unsigned n)
+{
+  if (pos >= capA) { eramCopy(src, pos - capA, n, 1); return; }
+  if (pos + n <= capA) { memcpy(bufA + pos, src, n); return; }
+  { unsigned a = capA - pos;                 /* straddles the A/B boundary */
+    memcpy(bufA + pos, src, a);
+    eramCopy(src + a, 0, n - a, 1); }
+}
+
+/* fetch n bytes from logical offset pos into dst */
+static void
+bufGet(unsigned pos, BYTE *dst, unsigned n)
+{
+  if (pos >= capA) { eramCopy(dst, pos - capA, n, 0); return; }
+  if (pos + n <= capA) { memcpy(dst, bufA + pos, n); return; }
+  { unsigned a = capA - pos;
+    memcpy(dst, bufA + pos, a);
+    eramCopy(dst + a, 0, n - a, 0); }
+}
+
+#if defined(USE_REU_DISKCOPY)
+/* Raw, page-aligned sector store/fetch in a fitted RAM expansion: one whole
+   256-byte sector per REU page.  No RLE - just a plain page-aligned DMA
+   (offs 0, count 256), the same access pattern the two-drive REU disk copy
+   uses, so it is reliable on real REU hardware. */
+static void
+reuPutSector(unsigned page, BYTE *src)
 {
   struct em_copy emc;
-  emc.buf = src; emc.page = (unsigned)(roff >> 8);
-  emc.offs = (unsigned)(roff & 0xff); emc.count = n;
+  emc.buf = src; emc.offs = 0; emc.page = page; emc.count = 256;
   em_copyto(&emc);
 }
 static void
-reuGet(unsigned long roff, BYTE *dst, unsigned n)
+reuGetSector(unsigned page, BYTE *dst)
 {
   struct em_copy emc;
-  emc.buf = dst; emc.page = (unsigned)(roff >> 8);
-  emc.offs = (unsigned)(roff & 0xff); emc.count = n;
+  emc.buf = dst; emc.offs = 0; emc.page = page; emc.count = 256;
   em_copyfrom(&emc);
 }
 #endif
-
-/* Move n bytes between RAM (mem) and logical offset pos in the combined buffer,
-   splitting across region A (heap), B (under-KERNAL) and, when fitted, C (REU).
-   toBuf != 0 stores into the buffer; 0 fetches from it.  pos is 32-bit because
-   a REU pushes the total capacity past 64 KB. */
-static void
-bufXfer(unsigned long pos, BYTE *mem, unsigned n, BYTE toBuf)
-{
-  while (n)
-    {
-      unsigned chunk;
-      if (pos < capA)                                   /* region A: heap */
-        {
-          chunk = (pos + n <= capA) ? n : (unsigned)(capA - pos);
-          if (toBuf) memcpy(bufA + (unsigned)pos, mem, chunk);
-          else       memcpy(mem, bufA + (unsigned)pos, chunk);
-        }
-      else if (pos < (unsigned long)capA + EREG_SIZE)   /* region B: under KERNAL */
-        {
-          unsigned eoff = (unsigned)(pos - capA);
-          unsigned room = EREG_SIZE - eoff;
-          chunk = (n <= room) ? n : room;
-          eramCopy(mem, eoff, chunk, toBuf);
-        }
-      else                                              /* region C: REU */
-        {
-          chunk = n;
-#if defined(USE_REU_DISKCOPY)
-          if (toBuf) reuPut(pos - capA - EREG_SIZE, mem, chunk);
-          else       reuGet(pos - capA - EREG_SIZE, mem, chunk);
-#endif
-        }
-      pos += chunk; mem += chunk; n -= chunk;
-    }
-}
-
-static void bufPut(unsigned long pos, BYTE *src, unsigned n) { bufXfer(pos, src, n, 1); }
-static void bufGet(unsigned long pos, BYTE *dst, unsigned n) { bufXfer(pos, dst, n, 0); }
 
 static int
 doDiskCopyBuffered(const BYTE device, const BYTE optimized)
 {
   const BYTE dt = devicetype[device];
   const BYTE tracks = maxTrack(dt);
-  unsigned avail;
-  unsigned long totalcap;
+  unsigned avail = 0, totalcap = 0;
+  unsigned reucap = 0;          /* REU capacity in whole sectors (0 = no REU) */
   BYTE use_reu = 0;
   BYTE ct = 0, cs = 0;          /* read cursor across the whole disk */
   BYTE done = 0;
@@ -1526,7 +1510,7 @@ doDiskCopyBuffered(const BYTE device, const BYTE optimized)
   newscreen(linebuffer);
 #if defined(USE_REU_DISKCOPY)
   if (em_pagecount() > 0)
-    cputs("\n\rSINGLE DRIVE, COMPRESSED RAM+REU BUFFER.\n\r");
+    cputs("\n\rSINGLE DRIVE, REU SECTOR BUFFER.\n\r");
   else
 #endif
     cputs("\n\rSINGLE DRIVE, COMPRESSED RAM BUFFER.\n\r");
@@ -1542,35 +1526,34 @@ doDiskCopyBuffered(const BYTE device, const BYTE optimized)
   freeDir(&dirs[0]);
   freeDir(&dirs[1]);
 
-  avail = _heapmaxavail();
-  capA = (avail > 0x500) ? avail - 0x300 : 0;
-  if (capA > 0x6000) capA = 0x6000;
-  bufA = capA ? malloc(capA) : NULL;
-  while (!bufA && capA > 0x200) { capA >>= 1; bufA = malloc(capA); }
-  if (!bufA) capA = 0;            /* fall back to the under-KERNAL 8 KB only */
-  totalcap = (unsigned long)capA + EREG_SIZE;
 #if defined(USE_REU_DISKCOPY)
-  /* a fitted REU becomes region C: far more compressed sectors fit per pass
-     (often the whole disk), so fewer - sometimes zero - disk swaps.  Cap it to
-     what one pass could ever need (DC_MAXSEC raw sectors). */
+  /* a fitted REU holds whole raw sectors (one per page); the disk usually fits
+     in one pass -> a single swap.  Capped to DC_MAXSEC sectors. */
   if (em_pagecount() > 0)
     {
-      unsigned long reucap  = (unsigned long)em_pagecount() * 256UL;
-      unsigned long maxneed = (unsigned long)DC_MAXSEC * 256UL;
-      if (totalcap + reucap > maxneed)
-        reucap = (maxneed > totalcap) ? maxneed - totalcap : 0;
-      totalcap += reucap;
+      reucap = (em_pagecount() > DC_MAXSEC) ? DC_MAXSEC : (unsigned)em_pagecount();
       use_reu = (reucap != 0);
     }
 #endif
+  if (!use_reu)
+    {
+      /* no REU: RLE-compress sectors into the heap (region A) plus the 8 KB
+         under the KERNAL (region B). */
+      avail = _heapmaxavail();
+      capA = (avail > 0x500) ? avail - 0x300 : 0;
+      if (capA > 0x6000) capA = 0x6000;
+      bufA = capA ? malloc(capA) : NULL;
+      while (!bufA && capA > 0x200) { capA >>= 1; bufA = malloc(capA); }
+      if (!bufA) capA = 0;          /* fall back to the under-KERNAL 8 KB only */
+      totalcap = capA + EREG_SIZE;
+    }
 
   while (!done)
     {
-      unsigned long bufpos = 0, off;
-      unsigned nsec = 0, i;
+      unsigned bufpos = 0, off = 0, nsec = 0, i;
       BYTE pt = ct, ps = cs;     /* this pass starts here */
       BYTE wt, ws;
-      unsigned clen;
+      unsigned clen = 0;
 
       /* ---- READ PASS (source disk in the drive) ---- */
       if (promptSwap("INSERT SOURCE DISK, THEN")) { ret = ABORT; goto finish; }
@@ -1579,22 +1562,32 @@ doDiskCopyBuffered(const BYTE device, const BYTE optimized)
         { cbm_close(9); cbm_close(6);
           newscreen("OPEN READ FAILED"); waitKey(0); ret = ERROR; goto finish; }
 
-      while (nsec < DC_MAXSEC)
+      while (nsec < (use_reu ? reucap : (unsigned)DC_MAXSEC))
         {
-          unsigned need;
           gotoxy(0, 3);
-          cprintf("READ  TRK %i SEC %i  BUF %lu/%lu %s ", ct+1, cs, bufpos, totalcap, use_reu ? "+REU" : "");
+          if (use_reu)
+            cprintf("READ  TRK %i SEC %i  %u SECS (REU)  ", ct+1, cs, nsec);
+          else
+            cprintf("READ  TRK %i SEC %i  BUF %u/%u   ", ct+1, cs, bufpos, totalcap);
           ret = cbm_write(6, linebuffer, sprintf(linebuffer, "u1:5 0 %i %i", ct+1, cs));
           if (ret < 0 || cbm_read(9, sectorBuf, 256) != 256)
             memset(sectorBuf, 0, 256);    /* read error -> zero sector (keeps alignment) */
-          clen = rle_compress_block(sectorBuf, 256, dcscratch, 256);
-          need = (clen == 0 || clen >= 256) ? 256 : clen;   /* didn't shrink -> raw */
-          if (bufpos + need > totalcap)
-            break;                         /* buffer full: cursor stays, continue next pass */
-          if (need == 256) { bufPut(bufpos, sectorBuf, 256); seclen[nsec] = 255; }
-          else             { bufPut(bufpos, dcscratch, clen); seclen[nsec] = (BYTE)(clen - 1); }
+#if defined(USE_REU_DISKCOPY)
+          if (use_reu)
+            reuPutSector(nsec, sectorBuf);   /* raw whole sector -> REU page */
+          else
+#endif
+            {
+              unsigned need;
+              clen = rle_compress_block(sectorBuf, 256, dcscratch, 256);
+              need = (clen == 0 || clen >= 256) ? 256 : clen;   /* didn't shrink -> raw */
+              if (bufpos + need > totalcap)
+                break;                       /* buffer full: cursor stays, continue next pass */
+              if (need == 256) { bufPut(bufpos, sectorBuf, 256); seclen[nsec] = 255; }
+              else             { bufPut(bufpos, dcscratch, clen); seclen[nsec] = (BYTE)(clen - 1); }
+              bufpos += need;
+            }
           ++nsec;
-          bufpos += need;
           if (!dcNext(dt, &ct, &cs)) { done = 1; break; }
         }
       cbm_close(9); cbm_close(6);
@@ -1612,13 +1605,20 @@ doDiskCopyBuffered(const BYTE device, const BYTE optimized)
       wt = pt; ws = ps; off = 0;
       for (i = 0; i < nsec; ++i)
         {
-          if (seclen[i] == 255)
-            { bufGet(off, sectorBuf, 256); clen = 256; }
+#if defined(USE_REU_DISKCOPY)
+          if (use_reu)
+            reuGetSector(i, sectorBuf);      /* raw whole sector from REU page */
           else
-            { clen = (unsigned)seclen[i] + 1;
-              bufGet(off, dcscratch, clen);
-              rle_decompress_to_mem(dcscratch, sectorBuf, 256); }
-          off += clen;
+#endif
+            {
+              if (seclen[i] == 255)
+                { bufGet(off, sectorBuf, 256); clen = 256; }
+              else
+                { clen = (unsigned)seclen[i] + 1;
+                  bufGet(off, dcscratch, clen);
+                  rle_decompress_to_mem(dcscratch, sectorBuf, 256); }
+              off += clen;
+            }
 
           gotoxy(0, 3);
           cprintf("WRITE TRK %i SEC %i  %u/%u    ", wt+1, ws, i+1, nsec);
